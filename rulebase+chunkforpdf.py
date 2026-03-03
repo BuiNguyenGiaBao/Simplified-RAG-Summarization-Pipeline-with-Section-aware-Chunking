@@ -1,102 +1,24 @@
 import re
-from typing import List, Tuple, Dict, Optional, Callable
+from typing import List, Tuple, Dict, Optional
 import nltk
 
 
-_TOKENIZER_BACKEND: str = "none"
-
-
-def _try_tiktoken() -> Optional[Callable]:
-    try:
-        import tiktoken  # type: ignore
-        enc = tiktoken.get_encoding("cl100k_base")
-
-        def _count(text: str) -> int:
-            return len(enc.encode(text))
-
-        def _encode(text: str) -> List[int]:
-            return enc.encode(text)
-
-        return _count, _encode, 
-    except Exception:
-        return None
-
-
-def _try_transformers() -> Optional[Callable]:
-    try:
-        from transformers import AutoTokenizer  # type: ignore
-        tok = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-        def _count(text: str) -> int:
-            return len(tok.encode(text, add_special_tokens=False))
-
-        def _encode(text: str) -> List[int]:
-            return tok.encode(text, add_special_tokens=False)
-
-        return _count, _encode, "transformers (bert-base-uncased)"
-    except Exception:
-        return None
-
-
-def _regex_tokenizer() -> Tuple[Callable, Callable, str]:
-    _SPLITTER = re.compile(
-        r"""
-        \w+(?:'\w+)*   # words (with optional contractions: don't, it's …)
-        |[^\w\s]       # any single non-word, non-space character (punctuation)
-        """,
-        re.VERBOSE,
-    )
-
-    def _count(text: str) -> int:
-        return len(_SPLITTER.findall(text))
-
-    def _encode(text: str) -> List[int]:
-        # Returns simple character-sum based IDs — good enough for counting
-        tokens = _SPLITTER.findall(text)
-        return [sum(ord(c) for c in t) for t in tokens]
-
-    return _count, _encode, "regex (built-in fallback)"
-
-
-def _init_tokenizer():
-    global _count_tokens_fn, _encode_fn, _TOKENIZER_BACKEND
-    result = _try_tiktoken() or _try_transformers()
-    if result:
-        _count_tokens_fn, _encode_fn, _TOKENIZER_BACKEND = result
-    else:
-        _count_tokens_fn, _encode_fn, _TOKENIZER_BACKEND = _regex_tokenizer()
-    print(f"[Tokenizer] Using backend: {_TOKENIZER_BACKEND}")
-
-
-_count_tokens_fn: Callable[[str], int]
-_encode_fn: Callable[[str], List[int]]
-_init_tokenizer()
-
-
-def count_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return _count_tokens_fn(text)
-
-
-def encode_text(text: str) -> List[int]:
-    if not text:
-        return []
-    return _encode_fn(text)
-
-
-def get_tokenizer_info() -> str:
-    return _TOKENIZER_BACKEND
-
-
 class ChunkConfig:
+    # Heading detection
     MAX_HEADING_LENGTH   = 120   # characters
-    MIN_SECTION_TOKENS   = 30    # was MIN_SECTION_WORDS = 20
-    MAX_CHUNK_TOKENS     = 400   # was MAX_CHUNK_WORDS = 300
-    OVERLAP_TOKENS       = 60    # was OVERLAP_WORDS = 40
-    MIN_CHUNK_TOKENS     = 60    # was MIN_CHUNK_WORDS = 50
     MAX_HEADING_WORDS    = 12
     TITLE_CASE_THRESHOLD = 0.6
+
+    # Section filtering
+    MIN_SECTION_WORDS    = 40    # drop tiny sections
+
+    # Chunking budgets (choose one primary budget)
+    MAX_CHUNK_WORDS      = 320   # sentence-aware word budget per chunk
+    OVERLAP_WORDS        = 40    # overlap in words (approx; implemented via sentences)
+    MIN_CHUNK_WORDS      = 80    # drop tiny chunks
+
+    # Optional character budget (secondary safety net)
+    MAX_CHUNK_CHARS      = 2200  # rough cap to avoid extreme long sentences/lines
 
 
 COMMON_SECTIONS = {
@@ -105,7 +27,7 @@ COMMON_SECTIONS = {
     "experiments", "experimental setup", "results", "discussion",
     "conclusion", "conclusions", "limitations", "future work",
     "acknowledgments", "acknowledgements", "references", "appendix",
-    "supplementary material", "supplementary materials"
+    "supplementary material", "supplementary materials", "bibliography"
 }
 
 RE_NUMBERED = re.compile(
@@ -121,6 +43,9 @@ def normalize_space(s: str) -> str:
         return ""
     return re.sub(r"\s+", " ", s).strip()
 
+def word_count(text: str) -> int:
+    text = normalize_space(text)
+    return 0 if not text else len(text.split())
 
 def looks_like_heading(line: str) -> bool:
     line = normalize_space(line)
@@ -128,24 +53,33 @@ def looks_like_heading(line: str) -> bool:
         return False
     if len(line) > ChunkConfig.MAX_HEADING_LENGTH:
         return False
+    # Avoid treating normal sentences as headings
     if line.endswith(".") and len(line.split()) > 3:
         return False
+
+    # Numbered headings like "1. Introduction", "2.3 Experiments", "IV. Results"
     m = RE_NUMBERED.match(line)
     if m:
         title = m.group(5).strip()
         return 1 <= len(title.split()) <= ChunkConfig.MAX_HEADING_WORDS
+
+    # ALL CAPS headings
     if line.isupper() and 1 <= len(line.split()) <= 10:
         return True
+
+    # Common section names
     low = line.lower()
     if low in COMMON_SECTIONS:
         return True
+
+    # Title Case heuristic
     words = line.split()
     if 1 <= len(words) <= 10:
         ratio = sum(w[0].isupper() for w in words if w) / max(len(words), 1)
         if ratio >= ChunkConfig.TITLE_CASE_THRESHOLD:
             return True
-    return False
 
+    return False
 
 def clean_heading(line: str) -> str:
     line = normalize_space(line)
@@ -154,170 +88,186 @@ def clean_heading(line: str) -> str:
         return normalize_space(m.group(5))
     return line.title() if line.isupper() else line
 
-
-
-
-def split_sentences_advanced(text: str) -> List[str]:
+def split_sentences(text: str) -> List[str]:
+    """Sentence splitting with NLTK fallback."""
     if not text or not text.strip():
         return []
     try:
-        sentences = nltk.sent_tokenize(text)
-        return [s.strip() for s in sentences if s.strip()]
+        sents = nltk.sent_tokenize(text)
+        return [s.strip() for s in sents if s and s.strip()]
     except Exception:
-        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
-        return [s.strip() for s in sentences if s.strip()]
+        # fallback: simple regex split
+        sents = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        return [s.strip() for s in sents if s and s.strip()]
+
 
 
 def rule_based_section_parse(text: str) -> List[Tuple[str, str]]:
+    """
+    Parse raw extracted text into (section_title, section_text).
+    Removes very short sections using word count.
+    """
     if not text or not text.strip():
         return []
-    try:
-        lines = [normalize_space(x) for x in text.splitlines()]
-        sections: List[Tuple[str, List[str]]] = []
-        current_title = "Body"
-        current_buf: List[str] = []
 
-        for line in lines:
-            if not line:
-                continue
-            if looks_like_heading(line):
-                if current_buf:
-                    sections.append((current_title, " ".join(current_buf).strip()))
-                    current_buf = []
-                current_title = clean_heading(line)
-            else:
-                current_buf.append(line)
+    lines = [normalize_space(x) for x in text.splitlines()]
+    sections: List[Tuple[str, List[str]]] = []
+    current_title = "Body"
+    current_buf: List[str] = []
 
-        if current_buf:
-            sections.append((current_title, " ".join(current_buf).strip()))
+    for line in lines:
+        if not line:
+            continue
+        if looks_like_heading(line):
+            if current_buf:
+                sections.append((current_title, " ".join(current_buf).strip()))
+                current_buf = []
+            current_title = clean_heading(line)
+        else:
+            current_buf.append(line)
 
-        # Filter short sections by token count (more accurate than word count)
-        sections = [
-            (t, c) for t, c in sections
-            if count_tokens(c) >= ChunkConfig.MIN_SECTION_TOKENS
-        ]
-        return sections
+    if current_buf:
+        sections.append((current_title, " ".join(current_buf).strip()))
 
-    except Exception as e:
-        print(f"Error parsing sections: {e}")
-        return []
+    # Filter tiny sections
+    filtered = []
+    for t, c in sections:
+        if word_count(c) >= ChunkConfig.MIN_SECTION_WORDS:
+            filtered.append((t, c))
+    return filtered
+
 
 def chunk_sections(
     sections: List[Tuple[str, str]],
-    max_tokens: Optional[int] = None,
-    overlap_tokens: Optional[int] = None,
-    use_advanced_splitting: bool = True,
+    max_words: Optional[int] = None,
+    overlap_words: Optional[int] = None,
+    min_words: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    drop_sections: Optional[set] = None,
 ) -> List[Dict]:
-    if max_tokens is None:
-        max_tokens = ChunkConfig.MAX_CHUNK_TOKENS
-    if overlap_tokens is None:
-        overlap_tokens = ChunkConfig.OVERLAP_TOKENS
+    """
+    Sentence-aware chunking with word/char budgets and overlap.
+    This intentionally avoids model tokenizers.
+    """
+    if max_words is None:
+        max_words = ChunkConfig.MAX_CHUNK_WORDS
+    if overlap_words is None:
+        overlap_words = ChunkConfig.OVERLAP_WORDS
+    if min_words is None:
+        min_words = ChunkConfig.MIN_CHUNK_WORDS
+    if max_chars is None:
+        max_chars = ChunkConfig.MAX_CHUNK_CHARS
+
+    if drop_sections is None:
+        drop_sections = {"references", "bibliography"}
 
     chunks: List[Dict] = []
     chunk_id = 0
 
     for section_title, content in sections:
-        if section_title.lower() in {"references", "bibliography"}:
+        if section_title.lower() in drop_sections:
             continue
-        if use_advanced_splitting:
-            sentences = split_sentences_advanced(content)
-        else:
-            sentences = re.split(r'(?<=[\.\?\!])\s+', content)
-            sentences = [s.strip() for s in sentences if s.strip()]
 
-        # Pre-compute token counts for each sentence (avoids repeated calls)
-        sent_tokens: List[int] = [count_tokens(s) for s in sentences]
+        sents = split_sentences(content)
+        if not sents:
+            continue
 
-        current_sents: List[str] = []
-        current_token_count: int = 0
+        current: List[str] = []
+        current_words = 0
+        current_chars = 0
 
-        def _flush(sents: List[str]) -> Optional[Dict]:
+        def flush(buf: List[str]) -> Optional[Dict]:
             nonlocal chunk_id
-            text = " ".join(sents).strip()
-            tc = count_tokens(text)
-            if tc >= ChunkConfig.MIN_CHUNK_TOKENS:
-                chunk = {
+            txt = normalize_space(" ".join(buf))
+            wc = word_count(txt)
+            if wc >= min_words:
+                out = {
                     "chunk_id": chunk_id,
                     "section": section_title,
-                    "text": text,
-                    "token_count": tc,
+                    "text": txt,
+                    "word_count": wc,
+                    "char_count": len(txt),
                 }
                 chunk_id += 1
-                return chunk
+                return out
             return None
 
-        def _build_overlap(sents: List[str]) -> Tuple[List[str], int]:
-            if overlap_tokens <= 0 or not sents:
-                return [], 0
-            overlap_sents: List[str] = []
+        def build_overlap(buf: List[str]) -> List[str]:
+            if overlap_words <= 0 or not buf:
+                return []
+            # collect sentences from the end until reaching overlap_words (approx by words)
+            ov: List[str] = []
             acc = 0
-            for s in reversed(sents):
-                tc = count_tokens(s)
-                if acc + tc > overlap_tokens and overlap_sents:
+            for s in reversed(buf):
+                w = len(s.split())
+                if acc + w > overlap_words and ov:
                     break
-                overlap_sents.insert(0, s)
-                acc += tc
-            return overlap_sents, acc
+                ov.insert(0, s)
+                acc += w
+            return ov
 
-        for sent, stc in zip(sentences, sent_tokens):
-            # Edge case: single sentence longer than the whole window
-            if stc >= max_tokens:
-                # Flush any pending content first
-                if current_sents:
-                    c = _flush(current_sents)
+        for s in sents:
+            s = s.strip()
+            if not s:
+                continue
+            s_words = len(s.split())
+            s_chars = len(s)
+
+            # If a single sentence is too long, emit it as a standalone chunk (flag oversized)
+            if s_words >= max_words or s_chars >= max_chars:
+                if current:
+                    c = flush(current)
                     if c:
                         chunks.append(c)
-                    current_sents, current_token_count = [], 0
+                    current, current_words, current_chars = [], 0, 0
 
-                # Emit the oversized sentence as its own chunk (truncation note)
-                long_text = sent.strip()
+                txt = normalize_space(s)
                 chunks.append({
                     "chunk_id": chunk_id,
                     "section": section_title,
-                    "text": long_text,
-                    "token_count": stc,
-                    "oversized": True,   # flag for downstream handling
+                    "text": txt,
+                    "word_count": word_count(txt),
+                    "char_count": len(txt),
+                    "oversized": True
                 })
                 chunk_id += 1
                 continue
 
-            if current_token_count + stc > max_tokens and current_sents:
-                c = _flush(current_sents)
+            # Check if adding this sentence exceeds budgets
+            if current and (current_words + s_words > max_words or current_chars + s_chars > max_chars):
+                c = flush(current)
                 if c:
                     chunks.append(c)
-                overlap_sents, overlap_tc = _build_overlap(current_sents)
-                current_sents = overlap_sents + [sent]
-                current_token_count = overlap_tc + stc
+                ov = build_overlap(current)
+                current = ov + [s]
+                current_words = sum(len(x.split()) for x in current)
+                current_chars = sum(len(x) for x in current)
             else:
-                current_sents.append(sent)
-                current_token_count += stc
+                current.append(s)
+                current_words += s_words
+                current_chars += s_chars
 
-        # Flush remainder
-        if current_sents:
-            c = _flush(current_sents)
+        if current:
+            c = flush(current)
             if c:
                 chunks.append(c)
 
     return chunks
 
-
-
-
 def process_document(
     text: str,
-    max_tokens: Optional[int] = None,
-    overlap_tokens: Optional[int] = None,
+    max_words: Optional[int] = None,
+    overlap_words: Optional[int] = None,
 ) -> Dict:
+    """
+    Full pipeline: section parse -> chunk.
+    """
     sections = rule_based_section_parse(text)
-    chunks = chunk_sections(
-        sections,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-    )
+    chunks = chunk_sections(sections, max_words=max_words, overlap_words=overlap_words)
     return {
-        "tokenizer":    get_tokenizer_info(),
-        "sections":     sections,
-        "chunks":       chunks,
+        "chunking": "sentence-aware word/char budget (Option A)",
+        "sections": sections,
+        "chunks": chunks,
         "num_sections": len(sections),
-        "num_chunks":   len(chunks),
+        "num_chunks": len(chunks),
     }

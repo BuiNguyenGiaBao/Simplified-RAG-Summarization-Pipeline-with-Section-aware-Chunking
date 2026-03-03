@@ -8,7 +8,6 @@ import faiss
 from dataclasses import dataclass
 import json
 from collections import OrderedDict
-import math
 
 @dataclass
 class Document:
@@ -23,8 +22,6 @@ class Document:
         return self.id == other.id
 
 class DenseEncoder(nn.Module):
-    """Dense encoder using transformer models"""
-    
     def __init__(self, model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
