@@ -1,0 +1,77 @@
+{
+  "builder_name": "arxiv-summarization",
+  "citation": "    @inproceedings{cohan-etal-2018-discourse,\n    title = \"A Discourse-Aware Attention Model for Abstractive Summarization of Long Documents\",\n    author = \"Cohan, Arman  and\n      Dernoncourt, Franck  and\n      Kim, Doo Soon  and\n      Bui, Trung  and\n      Kim, Seokhwan  and\n      Chang, Walter  and\n      Goharian, Nazli\",\n    booktitle = \"Proceedings of the 2018 Conference of the North {A}merican Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 2 (Short Papers)\",\n    month = jun,\n    year = \"2018\",\n    address = \"New Orleans, Louisiana\",\n    publisher = \"Association for Computational Linguistics\",\n    url = \"https://aclanthology.org/N18-2097\",\n    doi = \"10.18653/v1/N18-2097\",\n    pages = \"615--621\",\n    abstract = \"Neural abstractive summarization models have led to promising results in summarizing relatively short documents. We propose the first model for abstractive summarization of single, longer-form documents (e.g., research papers). Our approach consists of a new hierarchical encoder that models the discourse structure of a document, and an attentive discourse-aware decoder to generate the summary. Empirical results on two large-scale datasets of scientific papers show that our model significantly outperforms state-of-the-art models.\",\n}\n",
+  "config_name": "section",
+  "dataset_size": 7639488377,
+  "description": "\n Arxiv dataset for summarization.\n From paper: A Discourse-Aware Attention Model for Abstractive Summarization of Long Documents\" by A. Cohan et al.\n See: https://aclanthology.org/N18-2097.pdf \n See: https://github.com/armancohan/long-summarization\n",
+  "download_checksums": {
+    "train.zip": {
+      "num_bytes": 3364100438,
+      "checksum": null
+    },
+    "val.zip": {
+      "num_bytes": 102038141,
+      "checksum": null
+    },
+    "test.zip": {
+      "num_bytes": 102183593,
+      "checksum": null
+    }
+  },
+  "download_size": 3568322172,
+  "features": {
+    "article": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "abstract": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "https://github.com/armancohan/long-summarization",
+  "license": "",
+  "size_in_bytes": 11207810549,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 7201498856,
+      "num_examples": 203037,
+      "shard_lengths": [
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        15000,
+        14000,
+        14000,
+        15000,
+        10037
+      ],
+      "dataset_name": "arxiv-summarization"
+    },
+    "validation": {
+      "name": "validation",
+      "num_bytes": 218793173,
+      "num_examples": 6436,
+      "dataset_name": "arxiv-summarization"
+    },
+    "test": {
+      "name": "test",
+      "num_bytes": 219196348,
+      "num_examples": 6440,
+      "dataset_name": "arxiv-summarization"
+    }
+  },
+  "version": {
+    "version_str": "1.0.0",
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  }
+}
