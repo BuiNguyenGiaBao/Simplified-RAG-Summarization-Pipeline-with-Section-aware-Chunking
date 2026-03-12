@@ -9,9 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 
-# ---------------------------------------------------------------------------
 # Data classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Document:
@@ -26,11 +24,7 @@ class SearchResult:
     score: float
     rank: int
 
-
-# ---------------------------------------------------------------------------
 # Dense encoder
-# ---------------------------------------------------------------------------
-
 class DenseEncoder:
     """
     Encode text into L2-normalized dense embeddings using a frozen transformer.
@@ -98,10 +92,7 @@ class DenseEncoder:
         return np.vstack(all_embeddings).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
 # MMR dense retriever
-# ---------------------------------------------------------------------------
-
 class MMRDenseRetriever:
     """
     Dense retriever with Maximal Marginal Relevance (MMR) re-ranking.
@@ -125,9 +116,7 @@ class MMRDenseRetriever:
         self.doc_embeddings: Optional[np.ndarray] = None
         self.index: Optional[faiss.IndexFlatIP] = None
 
-    # ---------------------------------------------------------------------
     # Index management
-    # ---------------------------------------------------------------------
 
     def build_index(self, documents: List[Document]) -> None:
         if not documents:
@@ -141,9 +130,9 @@ class MMRDenseRetriever:
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(self.doc_embeddings)
 
-    # ---------------------------------------------------------------------
+
     # Retrieval helpers
-    # ---------------------------------------------------------------------
+
 
     def _ensure_ready(self) -> None:
         if self.index is None or self.doc_embeddings is None or not self.documents:
@@ -338,7 +327,7 @@ class MMRDenseRetriever:
     def build_training_contexts(
         self,
         query: str,
-        final_k: int = 5,
+        final_k: int = 3,
         noise_k: int = 2,
         shuffle: bool = False,
         seed: Optional[int] = None,

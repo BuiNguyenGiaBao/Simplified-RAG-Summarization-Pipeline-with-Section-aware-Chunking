@@ -84,8 +84,12 @@ class T5Summarizer:
         return "" if text is None else str(text).strip()
 
     def _format_contexts(
-    self,contexts: Optional[List[str]] = None,
-    retrieved_items: Optional[List[Any]] = None,include_section_headers: bool = False,max_contexts: Optional[int] = None,) -> List[str]:
+        self,
+        contexts: Optional[List[str]] = None,
+        retrieved_items: Optional[List[Any]] = None,
+        include_section_headers: bool = False,
+        max_contexts: Optional[int] = None,
+    ) -> List[str]:
         """
         Convert raw contexts or retrieved items into a clean
         list of context strings.
@@ -233,7 +237,6 @@ class T5Summarizer:
 
         parts: List[str] = []
 
-        clean_query = self._safe_strip(query)
         clean_query = self._safe_strip(query)
 
         if clean_query:

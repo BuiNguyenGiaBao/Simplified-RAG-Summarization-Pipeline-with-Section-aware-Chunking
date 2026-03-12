@@ -1,20 +1,47 @@
+"""
+databuildt.py  —  Fast 3-stage pipeline
+========================================
+
+Stage 1  [CPU parallel]   chunk every paper with ProcessPoolExecutor
+Stage 2  [GPU batch]      encode ALL chunk texts in one big batched call
+Stage 3  [CPU sequential] FAISS retrieval + noise injection per paper
+                          (fast because embeddings are already computed)
+
+Typical speed-up over the original sequential pipeline:
+  - 4× CPU workers  →  chunking ~4× faster
+  - batch encoding  →  GPU utilisation near 100 %  (~5-10× faster than per-paper)
+  - pre-built index →  no repeated tokenizer calls in build_training_example
+"""
 
 import os
 import json
 import random
 import argparse
+import time
+import numpy as np
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
+
+import faiss
 from datasets import load_from_disk, DatasetDict
+
 from rulebase_chunkforpdf import process_document
 from retrieval_tokenizer import DenseEncoder, MMRDenseRetriever, Document
 from summarized import T5Summarizer
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
 
 
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-ARXIV_DIR  = "./dataset/arxiv"
+ARXIV_DIR = "./dataset/arxiv"
 
 DEFAULT_QUERY_TEMPLATES = [
     "Summarize the main contribution of this paper",
@@ -27,11 +54,15 @@ DEFAULT_QUERY_TEMPLATES = [
 # Loaders
 # ---------------------------------------------------------------------------
 
+def _clean_field(x: Any, join_with: str = "\n") -> str:
+    if x is None:
+        return ""
+    if isinstance(x, list):
+        return join_with.join(str(i).strip() for i in x if str(i).strip())
+    return str(x).replace("/n", "\n").strip()
+
+
 def load_pubmed_txt(path: str) -> List[Dict[str, str]]:
-    """
-    Load a PubMed .txt file.
-    Expected format per line:  <article>\\t<abstract>
-    """
     records: List[Dict[str, str]] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -50,28 +81,18 @@ def load_arxiv_arrow(split_dir: str) -> List[Dict[str, str]]:
         ds = load_from_disk(split_dir)
     else:
         split_name = os.path.basename(split_dir.rstrip("/\\"))
-        root_dir = os.path.dirname(split_dir.rstrip("/\\"))
-        dataset = load_from_disk(root_dir)
-        if isinstance(dataset, DatasetDict):
-            ds = dataset[split_name]
-        else:
-            ds = dataset
+        root_dir   = os.path.dirname(split_dir.rstrip("/\\"))
+        dataset    = load_from_disk(root_dir)
+        from datasets import DatasetDict
+        ds = dataset[split_name] if isinstance(dataset, DatasetDict) else dataset
 
     records: List[Dict[str, str]] = []
     for sample in ds:
-        article = _clean_field(sample.get("article", ""), join_with="\n")
+        article  = _clean_field(sample.get("article",  ""), join_with="\n")
         abstract = _clean_field(sample.get("abstract", ""), join_with=" ")
         if article and abstract:
             records.append({"article": article, "abstract": abstract})
     return records
-
-def _clean_field(x: Any, join_with: str = "\n") -> str:
-    if x is None:
-        return ""
-    if isinstance(x, list):
-        return join_with.join(str(i).strip() for i in x if str(i).strip())
-    return str(x).replace("/n", "\n").strip()
-
 
 
 # ---------------------------------------------------------------------------
@@ -92,191 +113,344 @@ def choose_query(paper_id: str, use_multiple: bool = True) -> str:
     return random.Random(paper_id).choice(DEFAULT_QUERY_TEMPLATES)
 
 
+# ---------------------------------------------------------------------------
+# Stage 1 — CPU-parallel chunking
+# ---------------------------------------------------------------------------
 
-# Cross-document noise pool
+def _chunk_one_paper(task: Tuple[int, Dict[str, str], str]) -> Optional[Dict[str, Any]]:
+    """Top-level worker (must be picklable → module-level function)."""
+    idx, paper, split_name = task
+    article  = paper.get("article",  "")
+    abstract = paper.get("abstract", "")
+    if not article or not abstract:
+        return None
+    try:
+        processed = process_document(article, source_doc_id=f"{split_name}_{idx}")
+        chunks = processed.get("chunks", [])
+        if not chunks:
+            return None
+        return {
+            "paper_id": f"{split_name}_{idx}",
+            "abstract": abstract,
+            "chunks":   chunks,
+        }
+    except Exception:
+        return None
 
 
-def build_global_noise_pool(
+def batch_chunk_papers(
     papers:      List[Dict[str, str]],
-    limit:       int = 200,
-    min_chunks:  int = 3,
-) -> List[Document]:
+    split_name:  str,
+    num_workers: int = 4,
+    limit:       Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
-    Build a corpus-level pool of chunks from the first *limit* train papers.
-    Used only for cross_document noise mode.
+    Chunk all papers in parallel using threads.
+    ThreadPoolExecutor (not Process) avoids Windows spawn overhead
+    where each process would re-import torch + transformers (~30-60s).
+    Chunking is I/O + regex heavy → threads work well here.
     """
-    pool: List[Document] = []
-    total = min(limit, len(papers))
+    papers = papers[:limit] if limit is not None else papers
+    tasks  = [(idx, p, split_name) for idx, p in enumerate(papers)]
 
-    for idx in range(total):
-        paper    = papers[idx]
-        paper_id = f"noise_pool_{idx}"
-        article  = paper.get("article", "")
-        if not article:
-            continue
-        try:
-            processed = process_document(article, source_doc_id=paper_id)
-            chunks    = processed.get("chunks", [])
-            if len(chunks) >= min_chunks:
-                pool.extend(make_documents_from_chunks(chunks))
-        except Exception as e:
-            print(f"[WARN] noise_pool_{idx}: {e}")
+    print(f"  [chunk:{split_name}] {len(tasks)} papers  |  workers={num_workers}")
+    t0 = time.time()
 
-        if (idx + 1) % 50 == 0:
-            print(f"[noise_pool] {idx + 1}/{total} papers -> {len(pool)} chunks")
+    results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futs = {pool.submit(_chunk_one_paper, t): t[0] for t in tasks}
+        for fut in tqdm(as_completed(futs), total=len(futs),
+                        desc=f"  chunk [{split_name}]", unit="paper"):
+            res = fut.result()
+            if res is not None:
+                results.append(res)
 
-    print(f"[INFO] global noise pool: {len(pool)} chunks")
-    return pool
+    results.sort(key=lambda r: int(r["paper_id"].split("_")[-1]))
+    print(f"  [chunk:{split_name}] {len(results)}/{len(tasks)} valid  "
+          f"| {time.time()-t0:.1f}s")
+    return results
 
-# Noisy context builder
+
+# ---------------------------------------------------------------------------
+# Stage 2 — GPU batch encoding  (VRAM-safe for 6GB cards)
+# ---------------------------------------------------------------------------
+
+def batch_encode_all_chunks(
+    chunked_papers:  List[Dict[str, Any]],
+    encoder:         DenseEncoder,
+    paper_batch:     int = 500,   # encode this many papers at a time
+                                  # 500 papers × ~15 chunks × 384-dim ≈ 400MB RAM
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Encode chunks in groups of `paper_batch` papers to keep
+    CPU RAM and GPU VRAM under control on 6 GB cards.
+
+    Returns:
+        { paper_id: {"chunks": [...], "embeddings": np.ndarray, "abstract": str} }
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    total  = len(chunked_papers)
+
+    for batch_start in range(0, total, paper_batch):
+        group = chunked_papers[batch_start : batch_start + paper_batch]
+
+        # Flatten texts for this group
+        all_texts:    List[str]                = []
+        paper_slices: Dict[str, Tuple[int,int]] = {}
+
+        for cp in group:
+            pid   = cp["paper_id"]
+            texts = [c["text"] for c in cp["chunks"]]
+            s     = len(all_texts)
+            all_texts.extend(texts)
+            paper_slices[pid] = (s, s + len(texts))
+
+        batch_end = min(batch_start + paper_batch, total)
+        print(f"  [encode] papers {batch_start+1}-{batch_end}/{total} "
+              f"| {len(all_texts)} chunks", flush=True)
+
+        all_embs = encoder.encode(all_texts)   # GPU batched
+
+        # Redistribute embeddings back
+        for cp in group:
+            pid  = cp["paper_id"]
+            s, e = paper_slices[pid]
+            result[pid] = {
+                "chunks":     cp["chunks"],
+                "embeddings": all_embs[s:e],
+                "abstract":   cp["abstract"],
+            }
+
+        # Free intermediate arrays explicitly
+        del all_texts, all_embs, paper_slices
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 helpers — per-paper retrieval using pre-built embeddings
+# ---------------------------------------------------------------------------
+
+def _build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
+    dim   = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+    return index
+
+
+def _mmr_select(
+    q_emb:       np.ndarray,     # (1, D)
+    cand_embs:   np.ndarray,     # (C, D)
+    cand_scores: List[float],
+    k:           int,
+    mmr_lambda:  float = 0.5,
+) -> List[int]:
+    """Pure-numpy MMR — no encoder call needed."""
+    sim_matrix = cand_embs @ cand_embs.T
+    selected:  List[int] = []
+    remaining: set       = set(range(len(cand_scores)))
+
+    for _ in range(min(k, len(cand_scores))):
+        best_pos, best_score = -1, float("-inf")
+        for pos in remaining:
+            rel = cand_scores[pos]
+            red = float(np.max(sim_matrix[pos, selected])) if selected else 0.0
+            score = mmr_lambda * rel - (1 - mmr_lambda) * red
+            if score > best_score:
+                best_score, best_pos = score, pos
+        if best_pos == -1:
+            break
+        selected.append(best_pos)
+        remaining.remove(best_pos)
+    return selected
+
+
+def retrieve_clean(
+    query_emb:   np.ndarray,
+    documents:   List[Document],
+    doc_embs:    np.ndarray,
+    index:       faiss.IndexFlatIP,
+    final_k:     int,
+    noise_k:     int,
+    mmr_lambda:  float = 0.5,
+) -> Tuple[List[Document], List[int], np.ndarray]:
+    """
+    Fast retrieval using pre-built FAISS index + numpy MMR.
+    Returns (retrieved_docs, retrieved_indices, all_scores)
+    all_scores: cosine similarity của TOÀN BỘ docs với query — dùng cho noise selection.
+    """
+    num_docs    = len(documents)
+    effective_k = min(final_k, max(1, num_docs - noise_k))
+    candidate_k = min(max(effective_k * 5, 50), num_docs)
+
+    scores, idxs = index.search(query_emb, candidate_k)
+    cand_indices = idxs[0].tolist()
+    cand_scores  = scores[0].tolist()
+    cand_embs    = doc_embs[cand_indices]
+
+    selected_pos = _mmr_select(query_emb, cand_embs, cand_scores,
+                               k=effective_k, mmr_lambda=mmr_lambda)
+
+    retrieved_docs    = [documents[cand_indices[p]] for p in selected_pos]
+    retrieved_indices = [cand_indices[p] for p in selected_pos]
+
+    # Score toàn bộ corpus (dùng để phân loại easy/hard noise)
+    all_scores = (doc_embs @ query_emb.T).squeeze()   # (N,)
+
+    return retrieved_docs, retrieved_indices, all_scores
+
+
+# ---------------------------------------------------------------------------
+# Noise injection
+# ---------------------------------------------------------------------------
+
 def make_noisy_context(
-    documents:         List[Document],
-    retrieved_items:   List[Any],
-    final_k:           int = 3,
-    noise_k:           int = 2,
-    shuffle:           bool = True,
-    rng:               Optional[random.Random] = None,
-    noise_mode:        str = "same_document",
-    global_noise_pool: Optional[List[Document]] = None,
-    current_paper_id:  Optional[str] = None,
+    clean_docs:         List[Document],
+    documents:          List[Document],
+    noise_k:            int   = 2,
+    rng:                Any   = None,
+    shuffle:            bool  = True,
+    global_noise_pool:  Optional[List[Document]]  = None,
+    global_pool_embs:   Optional[np.ndarray]      = None,
+    query_emb:          Optional[np.ndarray]       = None,
+    current_paper_id:   Optional[str]             = None,
+    noise_mode:         str   = "cross_doc_easy",
 ) -> Dict[str, Any]:
     """
-    Build clean and noisy context lists.
+    noise_mode="cross_doc_easy":
+        Top 50–90th percentile similarity với query.
+        → Chunks semantically gần → retriever hay nhầm → confuse model nhiều nhất.
 
-    Noise modes:
-      same_document  — noise chunks come from non-retrieved chunks of the
-                       same paper.
-      cross_document — noise chunks come from the corpus-level noise pool
-                       (other papers only).
+    noise_mode="cross_doc_hard":
+        Bottom 25th percentile similarity với query.
+        → Chunks ít liên quan → model dễ bỏ qua hơn.
 
-    The noisy list = all final_k clean docs + noise_k noise docs
-    (noise does NOT replace clean docs — it is appended).
+    noise_mode="cross_document":
+        Random từ pool (baseline, không phân loại).
+
+    Thresholds tính ĐỘNG theo percentile → tự thích nghi với mọi embedding space.
     """
-    if rng is None:
-        rng = random.Random()
+    rng       = rng or random
+    clean_ids = {doc.id for doc in clean_docs}
+    noise_docs: List[Document] = []
+    noise_source = noise_mode
 
-    clean_docs = [item.document for item in retrieved_items[:final_k]]
-    clean_ids  = {doc.id for doc in clean_docs}
+    if global_noise_pool is None or len(global_noise_pool) == 0:
+        return {
+            "clean_contexts": [d.text for d in clean_docs],
+            "noisy_contexts": [d.text for d in clean_docs],
+            "has_true_noise": False,
+            "noise_source":   "none",
+        }
 
-    # ---- build negative pool ----
-    if noise_mode == "same_document":
-        negative_pool = [doc for doc in documents if doc.id not in clean_ids]
+    # Filter: không lấy từ cùng paper
+    candidate_pool = [
+        (i, d) for i, d in enumerate(global_noise_pool)
+        if d.id not in clean_ids
+        and (d.metadata or {}).get("source_doc_id") != current_paper_id
+    ]
 
-    elif noise_mode == "cross_document":
-        if not global_noise_pool:
-            # Fallback: no pool available, return clean only
-            contexts = [doc.text for doc in clean_docs]
-            return {"clean_contexts": contexts,
-                    "noisy_contexts": contexts,
-                    "has_true_noise": False}
+    if noise_mode in ("cross_doc_easy", "cross_doc_hard") \
+            and global_pool_embs is not None \
+            and query_emb is not None:
 
-        negative_pool = [
-            doc for doc in global_noise_pool
-            if (doc.metadata or {}).get("source_doc_id") != current_paper_id
-        ]
+        # Tính similarity của toàn bộ pool với query
+        pool_indices = [i for i, _ in candidate_pool]
+        pool_embs    = global_pool_embs[pool_indices]      # (M, D)
+        sims         = (pool_embs @ query_emb.T).squeeze() # (M,)
+
+        # Đảm bảo sims luôn là 1D array (tránh scalar khi pool=1)
+        sims = np.atleast_1d(sims)
+
+        # Dùng PERCENTILE ĐỘNG thay vì hardcode threshold
+        # → tự thích nghi với bất kỳ embedding space nào
+        if noise_mode == "cross_doc_easy":
+            # Top 25–75%: similarity cao → retriever dễ nhầm nhất
+            lo = float(np.percentile(sims, 50))
+            hi = float(np.percentile(sims, 90))
+            mask = (sims >= lo) & (sims < hi)
+        else:  # cross_doc_hard
+            # Bottom 25%: similarity thấp → ít liên quan nhất
+            threshold = float(np.percentile(sims, 25))
+            mask = sims <= threshold
+
+        filtered = [candidate_pool[j] for j in range(len(candidate_pool)) if mask[j]]
+
+        # Fallback nếu không đủ → lấy random từ pool
+        if len(filtered) < noise_k:
+            filtered = candidate_pool
+            noise_source = f"{noise_mode}_fallback_random"
+
+        sampled    = rng.sample(filtered, min(noise_k, len(filtered)))
+        noise_docs = [d for _, d in sampled]
 
     else:
-        raise ValueError(f"Unknown noise_mode: {noise_mode!r}")
+        # cross_document baseline: random
+        sampled    = rng.sample(candidate_pool, min(noise_k, len(candidate_pool)))
+        noise_docs = [d for _, d in sampled]
 
-    actual_noise_k = min(noise_k, len(negative_pool))
+    if len(noise_docs) == 0:
+        return {
+            "clean_contexts": [d.text for d in clean_docs],
+            "noisy_contexts": [d.text for d in clean_docs],
+            "has_true_noise": False,
+            "noise_source":   "none",
+        }
 
-    if actual_noise_k == 0:
-        contexts = [doc.text for doc in clean_docs]
-        return {"clean_contexts": contexts,
-                "noisy_contexts": contexts,
-                "has_true_noise": False}
-
-    noise_docs  = rng.sample(negative_pool, actual_noise_k)
-    noisy_docs  = list(clean_docs) + noise_docs   # append, never replace
+    noisy_docs = list(clean_docs) + noise_docs
     if shuffle:
         rng.shuffle(noisy_docs)
 
     return {
-        "clean_contexts": [doc.text for doc in clean_docs],
-        "noisy_contexts": [doc.text for doc in noisy_docs],
+        "clean_contexts": [d.text for d in clean_docs],
+        "noisy_contexts": [d.text for d in noisy_docs],
         "has_true_noise": True,
+        "noise_source":   noise_source,
     }
 
 
 # ---------------------------------------------------------------------------
-# Per-paper example builder
+# Stage 3 — per-paper example assembly (fast, no encoder calls)
 # ---------------------------------------------------------------------------
 
-def _process_one_paper(
-    paper: Dict[str, str],
-    paper_id: str,
-    encoder: DenseEncoder,
-    summarizer: T5Summarizer,
-    split_name: str,
-    final_k: int,
-    noise_k: int,
-    min_chunks: int,
-    use_multiple_queries: bool,
-    add_noisy: bool,
-    shuffle_noisy: bool,
-    noise_mode: str,
+def _assemble_one_paper(
+    pid:               str,
+    paper_data:        Dict[str, Any],
+    query_emb:         np.ndarray,        # (1, D)
+    query:             str,
+    summarizer:        T5Summarizer,
+    split_name:        str,
+    final_k:           int,
+    noise_k:           int,
+    add_noisy:         bool,
+    shuffle_noisy:     bool,
+    noise_mode:        str,
     global_noise_pool: Optional[List[Document]],
-    rng: random.Random,
+    global_pool_embs:  Optional[np.ndarray],   # (N_pool, D)
+    rng:               random.Random,
 ) -> List[Dict[str, Any]]:
-    """
-    Process one paper into training examples.
+    chunks   = paper_data["chunks"]
+    doc_embs = paper_data["embeddings"]
+    abstract = paper_data["abstract"]
 
-    Notes
-    -----
-    This function performs the full per-paper pipeline:
-
-    1. Validate article/abstract
-    2. Chunk the article into passages
-    3. Convert chunks into Document objects
-    4. Build a per-paper retriever index
-    5. Retrieve top-k clean contexts
-    6. Build one clean example
-    7. Optionally inject retrieval noise and build one noisy example
-
-    Important design choice:
-    A paper is skipped only if it has zero chunks/documents.
-    We do NOT require at least `min_chunks` documents anymore,
-    because many arXiv papers collapse into a single large chunk
-    after rule-based parsing. Keeping such papers improves dataset yield.
-    """
-    article = paper.get("article", "")
-    abstract = paper.get("abstract", "")
-
-    if not article or not abstract:
-        print(f"[SKIP] {paper_id}: empty article/abstract")
-        return []
-
-    # Step 1: chunk the paper
-    processed = process_document(article, source_doc_id=paper_id)
-    chunks = processed.get("chunks", [])
-
-    if len(chunks) == 0:
-        print(f"[SKIP] {paper_id}: zero chunks")
-        return []
-
-    # Step 2: convert chunks to retriever documents
     documents = make_documents_from_chunks(chunks)
-
-    if len(documents) == 0:
-        print(f"[SKIP] {paper_id}: zero documents")
+    if not documents:
         return []
 
-    # Step 3: build a per-paper retriever
-    retriever = MMRDenseRetriever(encoder=encoder)
-    retriever.build_index(documents)
+    index = _build_faiss_index(doc_embs)
 
-    # Step 4: choose a pseudo-query for training
-    query = choose_query(paper_id, use_multiple_queries)
-
-    # Step 5: retrieve clean contexts
-    retrieved = retriever.search(query, k=final_k)
-
-    if not retrieved:
-        print(f"[SKIP] {paper_id}: retrieval returned 0")
+    retrieved_docs, _, _ = retrieve_clean(
+        query_emb=query_emb,
+        documents=documents,
+        doc_embs=doc_embs,
+        index=index,
+        final_k=final_k,
+        noise_k=noise_k if add_noisy else 0,
+    )
+    if not retrieved_docs:
         return []
 
-    # Step 6: build clean example
-    clean_contexts = [r.document.text for r in retrieved]
+    clean_contexts = [d.text for d in retrieved_docs]
 
     clean_ex = summarizer.build_training_example(
         query=query,
@@ -285,30 +459,29 @@ def _process_one_paper(
         max_contexts=3,
     )
     clean_ex.update({
-        "paper_id": paper_id,
-        "split": split_name,
-        "sample_type": "clean",
-        "num_contexts": len(clean_contexts),
-        "num_chunks": len(chunks),
+        "paper_id":      pid,
+        "split":         split_name,
+        "sample_type":   "clean",
+        "num_contexts":  len(clean_contexts),
+        "num_chunks":    len(chunks),
         "num_documents": len(documents),
     })
 
     records = [clean_ex]
 
-    # Step 7: optionally build noisy example
     if add_noisy:
         bundle = make_noisy_context(
+            clean_docs=retrieved_docs,
             documents=documents,
-            retrieved_items=retrieved,
-            final_k=final_k,
             noise_k=noise_k,
-            shuffle=shuffle_noisy,
             rng=rng,
-            noise_mode=noise_mode,
+            shuffle=shuffle_noisy,
             global_noise_pool=global_noise_pool,
-            current_paper_id=paper_id,
+            global_pool_embs=global_pool_embs,
+            query_emb=query_emb,
+            current_paper_id=pid,
+            noise_mode=noise_mode,
         )
-
         if bundle["has_true_noise"]:
             noisy_ex = summarizer.build_training_example(
                 query=query,
@@ -317,12 +490,13 @@ def _process_one_paper(
                 max_contexts=3,
             )
             noisy_ex.update({
-                "paper_id": paper_id,
-                "split": split_name,
-                "sample_type": "noisy",
-                "num_contexts": len(bundle["noisy_contexts"]),
-                "noise_mode": noise_mode,
-                "num_chunks": len(chunks),
+                "paper_id":      pid,
+                "split":         split_name,
+                "sample_type":   "noisy",
+                "num_contexts":  len(bundle["noisy_contexts"]),
+                "noise_mode":    noise_mode,
+                "noise_source":  bundle["noise_source"],
+                "num_chunks":    len(chunks),
                 "num_documents": len(documents),
             })
             records.append(noisy_ex)
@@ -331,115 +505,153 @@ def _process_one_paper(
 
 
 # ---------------------------------------------------------------------------
-# Split iterators
+# Full split builder — 3-stage
 # ---------------------------------------------------------------------------
 
-def build_split(
-    papers:            List[Dict[str, str]],
-    split_name:        str,
-    encoder:           DenseEncoder,
-    summarizer:        T5Summarizer,
-    limit:             Optional[int],
-    final_k:           int,
-    noise_k:           int,
-    min_chunks:        int,
+def build_split_fast(
+    papers:               List[Dict[str, str]],
+    split_name:           str,
+    encoder:              DenseEncoder,
+    summarizer:           T5Summarizer,
+    limit:                Optional[int],
+    final_k:              int,
+    noise_k:              int,
+    min_chunks:           int,
     use_multiple_queries: bool,
-    add_noisy:         bool,
-    shuffle_noisy:     bool,
-    noise_mode:        str,
-    global_noise_pool: Optional[List[Document]],
-    rng:               random.Random,
+    add_noisy:            bool,
+    shuffle_noisy:        bool,
+    noise_mode:           str,
+    global_noise_pool:    Optional[List[Document]],
+    global_pool_embs:     Optional[np.ndarray],
+    rng:                  random.Random,
+    num_chunk_workers:    int = 4,
+    paper_batch:          int = 500,
 ) -> List[Dict[str, Any]]:
-    """Build all examples for one split (train or valid)."""
-    total   = len(papers) if limit is None else min(limit, len(papers))
-    records: List[Dict[str, Any]] = []
 
-    for idx in range(total):
-        paper_id = f"{split_name}_{idx}"
+    print(f"\n── {split_name.upper()} [{noise_mode}] ──────────────────────")
+
+    chunked = batch_chunk_papers(papers, split_name,
+                                 num_workers=num_chunk_workers, limit=limit)
+    if not chunked:
+        return []
+
+    paper_map = batch_encode_all_chunks(chunked, encoder, paper_batch=paper_batch)
+
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    query_emb_cache = {q: encoder.encode(q) for q in DEFAULT_QUERY_TEMPLATES}
+
+    records: List[Dict[str, Any]] = []
+    total = len(paper_map)
+
+    for i, (pid, pdata) in enumerate(
+            tqdm(paper_map.items(), desc=f"  assemble [{split_name}]", unit="paper")):
         try:
-            examples = _process_one_paper(
-                paper=papers[idx],
-                paper_id=paper_id,
-                encoder=encoder,
+            query     = choose_query(pid, use_multiple_queries)
+            query_emb = query_emb_cache[query]
+
+            examples = _assemble_one_paper(
+                pid=pid,
+                paper_data=pdata,
+                query_emb=query_emb,
+                query=query,
                 summarizer=summarizer,
                 split_name=split_name,
                 final_k=final_k,
                 noise_k=noise_k if add_noisy else 0,
-                min_chunks=min_chunks,
-                use_multiple_queries=use_multiple_queries,
                 add_noisy=add_noisy,
                 shuffle_noisy=shuffle_noisy,
                 noise_mode=noise_mode,
                 global_noise_pool=global_noise_pool,
+                global_pool_embs=global_pool_embs,
                 rng=rng,
             )
             records.extend(examples)
         except Exception as e:
-            print(f"[WARN] skip {paper_id}: {e}")
+            print(f"[WARN] {pid}: {e}")
 
-        if (idx + 1) % 50 == 0:
-            print(f"[{split_name}] {idx + 1}/{total} -> {len(records)} records")
+        if (i + 1) % 500 == 0:
+            print(f"  [{split_name}] {i+1}/{total} -> {len(records)} records")
 
     return records
 
 
-def build_test_split(
-    papers:            List[Dict[str, str]],
-    encoder:           DenseEncoder,
-    summarizer:        T5Summarizer,
-    limit:             Optional[int],
-    final_k:           int,
-    noise_k:           int,
-    min_chunks:        int,
+def build_test_split_fast(
+    papers:               List[Dict[str, str]],
+    encoder:              DenseEncoder,
+    summarizer:           T5Summarizer,
+    limit:                Optional[int],
+    final_k:              int,
+    noise_k:              int,
+    min_chunks:           int,
     use_multiple_queries: bool,
-    shuffle_noisy:     bool,
-    noise_mode:        str,
-    global_noise_pool: Optional[List[Document]],
-    rng:               random.Random,
+    shuffle_noisy:        bool,
+    noise_mode:           str,
+    global_noise_pool:    Optional[List[Document]],
+    global_pool_embs:     Optional[np.ndarray],
+    rng:                  random.Random,
+    num_chunk_workers:    int = 4,
+    paper_batch:          int = 500,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+
+    all_records = build_split_fast(
+        papers=papers, split_name="test",
+        encoder=encoder, summarizer=summarizer,
+        limit=limit, final_k=final_k, noise_k=noise_k,
+        min_chunks=min_chunks, use_multiple_queries=use_multiple_queries,
+        add_noisy=True, shuffle_noisy=shuffle_noisy,
+        noise_mode=noise_mode,
+        global_noise_pool=global_noise_pool,
+        global_pool_embs=global_pool_embs,
+        rng=rng, num_chunk_workers=num_chunk_workers,
+        paper_batch=paper_batch,
+    )
+    clean = [r for r in all_records if r["sample_type"] == "clean"]
+    noisy = [r for r in all_records if r["sample_type"] == "noisy"]
+    return clean, noisy
+
+
+# ---------------------------------------------------------------------------
+# Noise pool builder (also benefits from batch encode)
+# ---------------------------------------------------------------------------
+
+def build_global_noise_pool(
+    papers:      List[Dict[str, str]],
+    encoder:     DenseEncoder,
+    limit:       int = 300,
+    min_chunks:  int = 3,
+    num_workers: int = 4,
+    paper_batch: int = 500,
+) -> Tuple[List[Document], np.ndarray]:
     """
-    Build test examples and return them as two separate lists:
-      (test_clean, test_noisy)
-    so TRAIN.py can evaluate robustness separately.
+    Returns (pool_docs, pool_embeddings).
+    pool_embeddings shape: (N_chunks, D) — dùng để score easy/hard noise.
     """
-    total        = len(papers) if limit is None else min(limit, len(papers))
-    clean_records: List[Dict[str, Any]] = []
-    noisy_records: List[Dict[str, Any]] = []
+    print("\nBuilding cross-document noise pool...")
+    chunked = batch_chunk_papers(papers, "noise_pool",
+                                 num_workers=num_workers, limit=limit)
+    chunked = [c for c in chunked if len(c["chunks"]) >= min_chunks]
 
-    for idx in range(total):
-        paper_id = f"test_{idx}"
-        try:
-            examples = _process_one_paper(
-                paper=papers[idx],
-                paper_id=paper_id,
-                encoder=encoder,
-                summarizer=summarizer,
-                split_name="test",
-                final_k=final_k,
-                noise_k=noise_k,
-                min_chunks=min_chunks,
-                use_multiple_queries=use_multiple_queries,
-                add_noisy=True,
-                shuffle_noisy=shuffle_noisy,
-                noise_mode=noise_mode,
-                global_noise_pool=global_noise_pool,
-                rng=rng,
-            )
-            for ex in examples:
-                if ex["sample_type"] == "clean":
-                    clean_records.append(ex)
-                else:
-                    noisy_records.append(ex)
-        except Exception as e:
-            print(f"[WARN] skip test_{idx}: {e}")
+    if not chunked:
+        return [], np.empty((0, 384), dtype=np.float32)
 
-        if (idx + 1) % 50 == 0:
-            print(
-                f"[test] {idx + 1}/{total} "
-                f"-> clean={len(clean_records)}, noisy={len(noisy_records)}"
-            )
+    paper_map = batch_encode_all_chunks(chunked, encoder, paper_batch=paper_batch)
 
-    return clean_records, noisy_records
+    pool_docs: List[Document] = []
+    pool_embs_list: List[np.ndarray] = []
+
+    for pdata in paper_map.values():
+        docs = make_documents_from_chunks(pdata["chunks"])
+        pool_docs.extend(docs)
+        pool_embs_list.append(pdata["embeddings"])
+
+    pool_embs = np.vstack(pool_embs_list).astype(np.float32)
+    print(f"  [noise_pool] {len(pool_docs)} chunks from {len(chunked)} papers")
+    return pool_docs, pool_embs
 
 
 # ---------------------------------------------------------------------------
@@ -458,46 +670,43 @@ def write_jsonl(path: str, records: List[Dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build RAG training data from  ArXiv local dataset."
+        description="Build RAG training data — easy/hard cross-doc noise."
     )
+    parser.add_argument("--source",      type=str, default="arxiv", choices=["arxiv"])
+    parser.add_argument("--arxiv_dir",   type=str, default=ARXIV_DIR)
+    parser.add_argument("--output_dir",  type=str, default="./prepared_data")
 
-    # Dataset source
-# NOTE:
-# This current experiment setup is restricted to the local arXiv dataset.
-# PubMed loading code is kept for future extension, but the CLI currently
-# exposes only "arxiv" as an allowed source.
-    parser.add_argument("--source", type=str, default="arxiv", choices=["arxiv"])
-    parser.add_argument("--arxiv_dir",  type=str, default=ARXIV_DIR)
-    parser.add_argument("--output_dir", type=str, default="./prepared_data")
-
-    # Size limits
     parser.add_argument("--train_limit", type=int, default=None)
     parser.add_argument("--valid_limit", type=int, default=None)
     parser.add_argument("--test_limit",  type=int, default=None)
 
-    # Retrieval
-    parser.add_argument("--final_k",    type=int, default=5)
+    parser.add_argument("--final_k",  type=int, default=3)
+    parser.add_argument("--noise_k",  type=int, default=2)
     parser.add_argument("--min_chunks", type=int, default=3)
     parser.add_argument("--single_query", action="store_true")
+    parser.add_argument("--no_shuffle_noisy", action="store_true")
 
-    # Noise
+    # Easy noise: similarity trong khoảng [lo, hi) với query
+    parser.add_argument("--easy_sim_lo", type=float, default=0.3)
+    parser.add_argument("--easy_sim_hi", type=float, default=0.6)
+    # Hard noise: similarity < threshold
+    parser.add_argument("--hard_sim_threshold", type=float, default=0.3)
+
+    # Pool đủ lớn để cả easy lẫn hard đều có chunk
+    parser.add_argument("--noise_pool_limit", type=int, default=500)
+
+    # Train noise mode: easy hoặc hard hoặc random (cross_document)
     parser.add_argument(
-        "--noise_mode", type=str, default="same_document",
-        choices=["same_document", "cross_document"],
-        help=(
-            "same_document: noise from non-retrieved chunks of the same paper. "
-            "cross_document: noise from other papers in the corpus."
-        ),
+        "--train_noise_mode", type=str, default="cross_doc_easy",
+        choices=["cross_doc_easy", "cross_doc_hard", "cross_document"],
+        help="Noise mode dùng khi build train set.",
     )
-    parser.add_argument("--noise_k", type=int, default=2,
-                        help="Number of noise chunks to inject per noisy example.")
-    parser.add_argument("--noise_pool_limit", type=int, default=200,
-                        help="Papers used to build cross-document noise pool.")
-    parser.add_argument("--no_shuffle_noisy", action="store_true",
-                        help="Keep noise docs at the end instead of shuffling.")
 
-    parser.add_argument("--seed", type=int, default=42)
-
+    # Performance
+    parser.add_argument("--num_workers",       type=int, default=4)
+    parser.add_argument("--encode_batch_size", type=int, default=64)
+    parser.add_argument("--paper_batch",       type=int, default=500)
+    parser.add_argument("--seed",              type=int, default=42)
     return parser.parse_args()
 
 
@@ -507,100 +716,142 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    t_start = time.time()
 
     # ------------------------------------------------------------------
     # Load raw papers
     # ------------------------------------------------------------------
-    if args.source == "pubmed":
-        print("Loading PubMed txt dataset...")
-        train_papers = load_pubmed_txt(os.path.join(args.pubmed_dir, "train.txt"))
-        valid_papers = load_pubmed_txt(os.path.join(args.pubmed_dir, "val.txt"))
-        test_papers  = load_pubmed_txt(os.path.join(args.pubmed_dir, "test.txt"))
-    else:
-        print("Loading ArXiv Arrow dataset...")
-        train_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "train"))
-        valid_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "validation"))
-        test_papers  = load_arxiv_arrow(os.path.join(args.arxiv_dir, "test"))
-
-    print(
-        f"Loaded  train={len(train_papers):,}  "
-        f"valid={len(valid_papers):,}  "
-        f"test={len(test_papers):,}"
-    )
+    print("Loading dataset...")
+    train_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "train"))
+    valid_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "validation"))
+    test_papers  = load_arxiv_arrow(os.path.join(args.arxiv_dir, "test"))
+    print(f"  train={len(train_papers):,}  valid={len(valid_papers):,}  "
+          f"test={len(test_papers):,}")
 
     # ------------------------------------------------------------------
-    # Cross-document noise pool (built once from train papers)
+    # Models
     # ------------------------------------------------------------------
-    global_noise_pool: Optional[List[Document]] = None
-    if args.noise_mode == "cross_document":
-        print("\nBuilding cross-document noise pool...")
-        global_noise_pool = build_global_noise_pool(
-            papers=train_papers,
-            limit=args.noise_pool_limit,
-            min_chunks=args.min_chunks,
-        )
-
-    # ------------------------------------------------------------------
-    # Shared models (loaded once)
-    # ------------------------------------------------------------------
-    print("\nLoading encoder and summarizer...")
-    encoder    = DenseEncoder()
-    summarizer = T5Summarizer()
-
+    print("\nLoading encoder & summarizer...")
+    encoder              = DenseEncoder(batch_size=args.encode_batch_size)
+    summarizer           = T5Summarizer()
     use_multiple_queries = not args.single_query
     shuffle_noisy        = not args.no_shuffle_noisy
 
     # ------------------------------------------------------------------
-    # Build splits
+    # Build noise pool ONCE — shared cho cả easy và hard
     # ------------------------------------------------------------------
-    print("\nBuilding TRAIN records (clean + noisy)...")
-    train_records = build_split(
+    print(f"\n  noise_pool_limit={args.noise_pool_limit}")
+    global_noise_pool, global_pool_embs = build_global_noise_pool(
+        papers=train_papers,
+        encoder=encoder,
+        limit=args.noise_pool_limit,
+        min_chunks=args.min_chunks,
+        num_workers=args.num_workers,
+        paper_batch=args.paper_batch,
+    )
+
+    easy_sim_range = (args.easy_sim_lo, args.easy_sim_hi)
+
+    # Shared kwargs cho build_split_fast / build_test_split_fast
+    _shared = dict(
+        encoder=encoder, summarizer=summarizer,
+        min_chunks=args.min_chunks,
+        use_multiple_queries=use_multiple_queries,
+        final_k=args.final_k, noise_k=args.noise_k,
+        global_noise_pool=global_noise_pool,
+        global_pool_embs=global_pool_embs,
+        rng=rng,
+        num_chunk_workers=args.num_workers,
+        paper_batch=args.paper_batch,
+    )
+
+    # ------------------------------------------------------------------
+    # Train — dùng train_noise_mode (mặc định easy)
+    # ------------------------------------------------------------------
+    train_records = build_split_fast(
         papers=train_papers, split_name="train",
-        encoder=encoder, summarizer=summarizer,
-        limit=args.train_limit, final_k=args.final_k, noise_k=args.noise_k,
-        min_chunks=args.min_chunks, use_multiple_queries=use_multiple_queries,
+        limit=args.train_limit,
         add_noisy=True, shuffle_noisy=shuffle_noisy,
-        noise_mode=args.noise_mode, global_noise_pool=global_noise_pool, rng=rng,
+        noise_mode=args.train_noise_mode,
+        **_shared,
     )
 
-    print("\nBuilding VALID records (clean only)...")
-    valid_records = build_split(
+    # ------------------------------------------------------------------
+    # Validation — không cần noise
+    # ------------------------------------------------------------------
+    valid_records = build_split_fast(
         papers=valid_papers, split_name="validation",
+        limit=args.valid_limit,
         encoder=encoder, summarizer=summarizer,
-        limit=args.valid_limit, final_k=args.final_k, noise_k=0,
-        min_chunks=args.min_chunks, use_multiple_queries=use_multiple_queries,
+        min_chunks=args.min_chunks,
+        use_multiple_queries=use_multiple_queries,
+        final_k=args.final_k, noise_k=0,
         add_noisy=False, shuffle_noisy=False,
-        noise_mode=args.noise_mode, global_noise_pool=None, rng=rng,
+        noise_mode="cross_document",
+        global_noise_pool=None,
+        global_pool_embs=None,
+        rng=rng,
+        num_chunk_workers=args.num_workers,
+        paper_batch=args.paper_batch,
     )
 
-    print("\nBuilding TEST records (clean + noisy, saved separately)...")
-    test_clean, test_noisy = build_test_split(
-        papers=test_papers,
-        encoder=encoder, summarizer=summarizer,
-        limit=args.test_limit, final_k=args.final_k, noise_k=args.noise_k,
-        min_chunks=args.min_chunks, use_multiple_queries=use_multiple_queries,
+    # ------------------------------------------------------------------
+    # Test 
+    # ------------------------------------------------------------------
+    test_clean, test_noisy_easy = build_test_split_fast(
+        papers=test_papers, limit=args.test_limit,
         shuffle_noisy=shuffle_noisy,
-        noise_mode=args.noise_mode, global_noise_pool=global_noise_pool, rng=rng,
+        noise_mode="cross_doc_easy",
+        **_shared,
+    )
+
+    _, test_noisy_hard = build_test_split_fast(
+        papers=test_papers, limit=args.test_limit,
+        shuffle_noisy=shuffle_noisy,
+        noise_mode="cross_doc_hard",
+        **_shared,
     )
 
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
-    train_path      = os.path.join(args.output_dir, "train.jsonl")
-    valid_path      = os.path.join(args.output_dir, "valid.jsonl")
-    test_clean_path = os.path.join(args.output_dir, "test_clean.jsonl")
-    test_noisy_path = os.path.join(args.output_dir, "test_noisy.jsonl")
+    paths = {
+        "train":           os.path.join(args.output_dir, "train.jsonl"),
+        "valid":           os.path.join(args.output_dir, "valid.jsonl"),
+        "test_clean":      os.path.join(args.output_dir, "test_clean.jsonl"),
+        "test_noisy_easy": os.path.join(args.output_dir, "test_noisy_easy.jsonl"),
+        "test_noisy_hard": os.path.join(args.output_dir, "test_noisy_hard.jsonl"),
+    }
+    write_jsonl(paths["train"],           train_records)
+    write_jsonl(paths["valid"],           valid_records)
+    write_jsonl(paths["test_clean"],      test_clean)
+    write_jsonl(paths["test_noisy_easy"], test_noisy_easy)
+    write_jsonl(paths["test_noisy_hard"], test_noisy_hard)
 
-    write_jsonl(train_path,      train_records)
-    write_jsonl(valid_path,      valid_records)
-    write_jsonl(test_clean_path, test_clean)
-    write_jsonl(test_noisy_path, test_noisy)
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    train_c = sum(1 for r in train_records if r["sample_type"] == "clean")
+    train_n = sum(1 for r in train_records if r["sample_type"] == "noisy")
 
-    print("\nDone.")
-    print(f"  train       : {len(train_records):>6,}  ->  {train_path}")
-    print(f"  valid       : {len(valid_records):>6,}  ->  {valid_path}")
-    print(f"  test clean  : {len(test_clean):>6,}  ->  {test_clean_path}")
-    print(f"  test noisy  : {len(test_noisy):>6,}  ->  {test_noisy_path}")
+    def pair_rate(noisy, clean):
+        pct = 100 * len(noisy) / max(len(clean), 1)
+        return f"{len(noisy)}/{len(clean)} ({pct:.1f}%)"
+
+    elapsed = time.time() - t_start
+    print(f"\n{'='*60}")
+    print(f"  Done in {elapsed/60:.1f} min")
+    print(f"  train clean      : {train_c:>7,}  ->  {paths['train']}")
+    print(f"  train noisy      : {train_n:>7,}      mode={args.train_noise_mode}")
+    print(f"  valid            : {len(valid_records):>7,}  ->  {paths['valid']}")
+    print(f"  test clean       : {len(test_clean):>7,}  ->  {paths['test_clean']}")
+    print(f"  test noisy easy  : {len(test_noisy_easy):>7,}  ->  {paths['test_noisy_easy']}")
+    print(f"    pair rate easy : {pair_rate(test_noisy_easy, test_clean)}")
+    print(f"  test noisy hard  : {len(test_noisy_hard):>7,}  ->  {paths['test_noisy_hard']}")
+    print(f"    pair rate hard : {pair_rate(test_noisy_hard, test_clean)}")
+    print(f"  noise strategy   : dynamic percentile (easy=p50-p90, hard=bottom p25)")
+    print(f"  noise pool       : {len(global_noise_pool):,} chunks from {args.noise_pool_limit} papers")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

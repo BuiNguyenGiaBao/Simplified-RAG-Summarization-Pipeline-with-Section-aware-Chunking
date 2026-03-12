@@ -11,9 +11,9 @@ class ChunkConfig:
 
     MIN_SECTION_WORDS    = 10    # drop sections shorter than this
 
-    MAX_CHUNK_WORDS      = 220   # hard cap on chunk length
-    OVERLAP_WORDS        = 40    # sentences carried over to the next chunk
-    MIN_CHUNK_WORDS      = 60    # chunks smaller than this are merged forward
+    MAX_CHUNK_WORDS      = 150   # ↓ từ 220 → tạo ~1.5x chunks/paper
+    OVERLAP_WORDS        = 30    # ↓ từ 40
+    MIN_CHUNK_WORDS      = 40    # ↓ từ 60
 
 
 COMMON_SECTIONS = {
